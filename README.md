@@ -6,9 +6,15 @@
       - [什么是ONNX？](#什么是onnx)
       - [ProtoBuf简介](#protobuf简介)
       - [ONNX格式分析](#onnx格式分析)
+  - [从零开始部署](#从零开始部署)
+    - [第一步：模型文件-\>ONNX文件](#第一步模型文件-onnx文件)
+    - [第二步：ONNX格式模型-\>端侧推理框架模型](#第二步onnx格式模型-端侧推理框架模型)
 
+<div align="center">
 
 # 模型端侧部署
+
+</div>  
 
 ## 什么是端侧部署？
 
@@ -66,4 +72,92 @@ AttributeProto
 
 最后，每个计算节点中还包含了一个AttributeProto数组，用来描述该节点的属性，比如Conv节点或者说卷积层的属性包含group，pad，strides等等，每一个计算节点的属性，输入输出信息都详细记录在（https://github.com/onnx/onnx/blob/master/docs/Operators.md。）
 
-在ONNX学习笔记这一篇文章，还有介绍`onnx.helper`，它提供的make_node，make_graph，make_tensor等等接口完成一个ONNX模型的构建，还有
+在ONNX学习笔记这一篇文章，还有介绍`onnx.helper`，它提供的make_node，make_graph，make_tensor等等接口完成一个ONNX模型的构建，还有`onnx-simplifier`这些的介绍，我在这里不过多阐述
+
+## 从零开始部署
+
+    我这里利用Pytroch的框架来进行从零开始端侧部署
+
+### 第一步：模型文件->ONNX文件
+Pytorch保存模型有两种方法：
+> 第一种方法只保存模型参数。  
+> 第二种方法保存完整模型。推荐使用第一种，第二种方法可能在切换设备和目录的时候出现各种问题。
+- 保存模型参数方法:
+  ```py
+  print(model.state_dict().keys())                                # 输出模型参数名称
+    
+  # 保存模型参数到路径"./data/model_parameter.pkl"
+  torch.save(model.state_dict(), "./data/model_parameter.pkl")
+  new_model = Model()                                                    # 调用模型Model
+  new_model.load_state_dict(torch.load("./data/model_parameter.pkl"))    # 加载模型参数     
+  new_model.forward(input)                                               # 进行使用
+  ``` 
+- 保存完整模型(不推荐)
+  ```py
+  torch.save(model, './data/model.pkl')        # 保存整个模型
+  new_model = torch.load('./data/model.pkl')   # 加载模型
+  ``` 
+
+    目前大多数应用都会仅仅保存模型参数，用的时候创建模型结构，然后加载模型。
+    以pytorch为例，保存的模型为.pkl或者.model格式，可以用[`Netron`](https://netron.app/)打开查看。
+
+- 接下来，是把模型参数文件和结构打包成ONNX的格式：
+    ```py
+    # onnx模型导入
+    import onnx
+    import torch
+    import torch.nn as nn
+    import torchvision.models as models
+
+
+    class Net(nn.Module):
+
+        def __init__(self, prior_size):
+            …………………
+
+        def forward(self, x):
+            …………………
+            return x
+
+    model = Net(prior_size)
+    model.load_state_dict(torch.load('xxx.model', map_location='cpu'))
+    model.eval()
+
+    input_names = ['input']
+    output_names = ['output']
+    # 规定输入尺寸
+    x = torch.randn(1, 3, 240, 320, requires_grad=True)
+    torch.onnx.export(model, x, 'best.onnx', input_names=input_names, output_names=output_names, verbose='True')
+    ``` 
+    > - 首先，导入所需的库，包括onnx、torch、torch.nn和torchvision.models。  
+    > - 然后定义了一个名为Net的自定义神经网络类，继承自nn.Module。在Net的构造函数__init__中可以添加网络的各个层和参数。  
+    > - forward方法定义了模型的前向传播过程，即输入数据通过网络层进行计算，最后返回输出结果。  
+    >  - 创建了一个Net类的实例model，并使用torch.load函数加载预训练的模型参数文件（xxx.model）到该实例中。map_location='cpu'参数表示将模型参数加载到CPU上。  
+    >  - 使用model.eval()将模型设置为评估模式，这通常会关闭一些具有随机性质的操作，如Dropout和Batch Normalization的随机失活。  
+    >  - 定义了input_names和output_names，分别表示导出的ONNX模型的输入和输出名称。  
+    >  - 创建一个输入张量x，大小为(1, 3, 240, 320)，并用随机数填充。这里的尺寸是根据模型的输入要求进行定义的。  
+    >  - 最后，使用torch.onnx.export函数将model导出为ONNX格式，并保存为文件best.onnx。函数的参数包括模型实例model、输入张量x、导出的ONNX文件路径、输入和输出的名称，以及一个可选的verbose参数用于打印导出过程中的详细信息。  
+- 验证转换是否成功：
+    ```py
+    # 验证onnx模型
+    import onnx
+
+    model_onnx = onnx.load("best.onnx")  # 加载onnx模型
+    onnx.checker.check_model(model_onnx)  # 验证onnx模型是否成功导出
+    # 如果没有报错，表示导出成功
+    #####################################################################################
+    # #测试onnx 模型
+    import onnxruntime
+    import numpy as np
+
+    # 创建会话
+    # session = onnxruntime.InferenceSession("best.onnx", providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    session = onnxruntime.InferenceSession("best.onnx", providers=['CPUExecutionProvider'])
+    x = np.random.randn(1, 3, 240, 320)
+    ort_input = {session.get_inputs()[0].name: x.astype(np.float32)}
+    ort_output = session.run(None, ort_input)
+    # # 如果没有报错，表示执行成功
+    ```
+    经过上面的处理后，会得到一个名为best.onnx的文件。
+
+### 第二步：ONNX格式模型->端侧推理框架模型
